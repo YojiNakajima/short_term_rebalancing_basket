@@ -5,6 +5,8 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from infrastructure.mt5.symbols_report import (
+    SymbolSnapshot,
+    adjust_lots_to_base,
     collect_target_symbol_snapshots,
     fetch_symbol_snapshot,
     get_enabled_target_symbols,
@@ -12,6 +14,63 @@ from infrastructure.mt5.symbols_report import (
 
 
 class TestMt5SymbolsReport(unittest.TestCase):
+    def test_adjust_lots_to_base_uses_xauusd_001_lot_as_base(self) -> None:
+        rows = [
+            SymbolSnapshot(
+                symbol="XAUUSD",
+                exists=True,
+                usd_per_lot=200_000.0,
+                volume_min=0.01,
+                volume_step=0.01,
+            ),
+            SymbolSnapshot(
+                symbol="AAA",
+                exists=True,
+                usd_per_lot=1_000.0,
+                volume_min=0.1,
+                volume_step=0.1,
+            ),
+        ]
+
+        adjusted = adjust_lots_to_base(rows)
+        base = next(r for r in adjusted if r.symbol == "XAUUSD")
+        a = next(r for r in adjusted if r.symbol == "AAA")
+
+        self.assertAlmostEqual(base.lot_for_base or 0.0, 0.01)
+        self.assertAlmostEqual(base.usd_for_base_lot or 0.0, 200_000.0 * 0.01)
+        self.assertAlmostEqual(base.usd_diff_to_base or 0.0, 0.0)
+
+        self.assertAlmostEqual(a.lot_for_base or 0.0, 2.0)
+        self.assertAlmostEqual(a.usd_for_base_lot or 0.0, 2.0 * 1_000.0)
+        self.assertAlmostEqual(a.usd_diff_to_base or 0.0, 0.0)
+
+    def test_adjust_lots_to_base_rounds_to_nearest_step(self) -> None:
+        rows = [
+            SymbolSnapshot(
+                symbol="XAUUSD",
+                exists=True,
+                usd_per_lot=200_000.0,
+                volume_min=0.01,
+                volume_step=0.01,
+            ),
+            SymbolSnapshot(
+                symbol="BBB",
+                exists=True,
+                usd_per_lot=900.0,
+                volume_min=0.1,
+                volume_step=0.1,
+            ),
+        ]
+
+        # base_usd = 200_000 * 0.01 = 2_000
+        # ideal lot for BBB = 2_000 / 900 = 2.222...
+        # candidates on 0.1 steps => 2.2 (1_980) vs 2.3 (2_070) => choose 2.2
+        adjusted = adjust_lots_to_base(rows)
+        b = next(r for r in adjusted if r.symbol == "BBB")
+        self.assertAlmostEqual(b.lot_for_base or 0.0, 2.2)
+        self.assertAlmostEqual(b.usd_for_base_lot or 0.0, 2.2 * 900.0)
+        self.assertAlmostEqual(b.usd_diff_to_base or 0.0, (2.2 * 900.0) - 2_000.0)
+
     def test_get_enabled_target_symbols_uses_only_explicit_true(self) -> None:
         settings_module = SimpleNamespace(
             target_symbols={"AAA": True, "BBB": False, "CCC": 1, "DDD": "true"}
@@ -150,9 +209,11 @@ class TestMt5SymbolsReport(unittest.TestCase):
                 env_path, settings_module=settings_module, module=module
             )
 
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0].symbol, "AAA")
+        self.assertEqual([r.symbol for r in rows], ["XAUUSD", "AAA"])
         self.assertEqual(rows[0].contract_size, 1.0)
+        self.assertEqual(rows[1].contract_size, 1.0)
+        self.assertAlmostEqual(rows[0].lot_for_base or 0.0, 0.01)
+        self.assertAlmostEqual(rows[1].lot_for_base or 0.0, 0.01)
         module.shutdown.assert_called_once_with()
 
 

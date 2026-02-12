@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 from dataclasses import dataclass
+import math
 from typing import Any, Optional
 
 from config import settings
@@ -29,8 +30,18 @@ class SymbolSnapshot:
     usd_per_lot: Optional[float] = None
     volume_min: Optional[float] = None
     volume_step: Optional[float] = None
+    volume_max: Optional[float] = None
+
+    # Lot adjusted to match the base USD value (derived from XAUUSD 0.01 lot)
+    lot_for_base: Optional[float] = None
+    usd_for_base_lot: Optional[float] = None
+    usd_diff_to_base: Optional[float] = None
     error: Optional[str] = None
     usd_pair_error: Optional[str] = None
+
+
+BASE_SYMBOL = "XAUUSD"
+BASE_LOT = 0.01
 
 
 def get_enabled_target_symbols(*, settings_module: Any = settings) -> list[str]:
@@ -93,6 +104,156 @@ def _get_contract_size(info: Any) -> Optional[float]:
         if v is not None:
             return v
     return None
+
+
+def _float_precision_from_step(step: float) -> int:
+    if step <= 0:
+        return 8
+
+    # Try to infer decimal places from the step size.
+    # Example: 0.01 -> 2, 0.1 -> 1, 1.0 -> 0
+    s = f"{step:.16f}".rstrip("0").rstrip(".")
+    if "." not in s:
+        return 0
+    return min(8, len(s.split(".", 1)[1]))
+
+
+def _round_lot(lot: float, *, step: Optional[float]) -> float:
+    if step is None:
+        return lot
+    try:
+        p = _float_precision_from_step(float(step))
+    except Exception:
+        return lot
+    return round(lot, p)
+
+
+def _nearest_lot_for_target_usd(
+    *,
+    target_usd: float,
+    usd_per_lot: float,
+    volume_min: float,
+    volume_step: float,
+    volume_max: Optional[float],
+) -> Optional[float]:
+    if usd_per_lot <= 0 or volume_step <= 0 or volume_min <= 0:
+        return None
+
+    ideal = target_usd / usd_per_lot
+    if ideal <= volume_min:
+        lot = volume_min
+        if volume_max is not None:
+            lot = min(lot, volume_max)
+        return _round_lot(lot, step=volume_step)
+
+    steps = (ideal - volume_min) / volume_step
+    if not math.isfinite(steps):
+        return None
+
+    n_floor = int(math.floor(steps))
+    n_ceil = int(math.ceil(steps))
+
+    candidates: list[float] = []
+    for n in {n_floor - 1, n_floor, n_ceil, n_ceil + 1}:
+        if n < 0:
+            continue
+        lot = volume_min + (n * volume_step)
+        if lot < volume_min:
+            continue
+        if volume_max is not None and lot > volume_max:
+            continue
+        candidates.append(lot)
+
+    if not candidates:
+        if volume_max is not None and volume_max >= volume_min:
+            return _round_lot(volume_max, step=volume_step)
+        return _round_lot(volume_min, step=volume_step)
+
+    def score(lot: float) -> tuple[float, float]:
+        usd = usd_per_lot * lot
+        return (abs(usd - target_usd), lot)
+
+    best = min(candidates, key=score)
+    return _round_lot(best, step=volume_step)
+
+
+def adjust_lots_to_base(
+    rows: list[SymbolSnapshot],
+    *,
+    base_symbol: str = BASE_SYMBOL,
+    base_lot: float = BASE_LOT,
+) -> list[SymbolSnapshot]:
+    base = next((r for r in rows if r.symbol == base_symbol), None)
+    if base is None:
+        return rows
+
+    base_lot_used = base_lot
+    if base.volume_min is not None:
+        base_lot_used = max(base_lot_used, float(base.volume_min))
+    if base.volume_step is not None and base.volume_min is not None and base_lot_used > base.volume_min:
+        # Align to step increments starting from volume_min.
+        n = (base_lot_used - float(base.volume_min)) / float(base.volume_step)
+        base_lot_used = float(base.volume_min) + (math.ceil(n) * float(base.volume_step))
+        base_lot_used = _round_lot(base_lot_used, step=float(base.volume_step))
+
+    base_usd = None
+    if base.usd_per_lot is not None:
+        base_usd = float(base.usd_per_lot) * float(base_lot_used)
+
+    adjusted: list[SymbolSnapshot] = []
+    for r in rows:
+        lot_for_base: Optional[float]
+        usd_for_base_lot: Optional[float]
+        usd_diff_to_base: Optional[float]
+
+        if r.symbol == base_symbol:
+            lot_for_base = float(base_lot_used)
+            usd_for_base_lot = float(base_usd) if base_usd is not None else None
+            usd_diff_to_base = 0.0 if base_usd is not None else None
+        else:
+            lot_for_base = None
+            usd_for_base_lot = None
+            usd_diff_to_base = None
+
+            if (
+                base_usd is not None
+                and r.usd_per_lot is not None
+                and r.volume_min is not None
+                and r.volume_step is not None
+            ):
+                lot_for_base = _nearest_lot_for_target_usd(
+                    target_usd=float(base_usd),
+                    usd_per_lot=float(r.usd_per_lot),
+                    volume_min=float(r.volume_min),
+                    volume_step=float(r.volume_step),
+                    volume_max=float(r.volume_max) if r.volume_max is not None else None,
+                )
+                if lot_for_base is not None:
+                    usd_for_base_lot = float(r.usd_per_lot) * float(lot_for_base)
+                    usd_diff_to_base = usd_for_base_lot - float(base_usd)
+
+        adjusted.append(
+            SymbolSnapshot(
+                symbol=r.symbol,
+                exists=r.exists,
+                sell=r.sell,
+                contract_size=r.contract_size,
+                currency_profit=r.currency_profit,
+                usd_pair_symbol=r.usd_pair_symbol,
+                usd_pair_sell=r.usd_pair_sell,
+                usd_per_lot=r.usd_per_lot,
+                volume_min=r.volume_min,
+                volume_step=r.volume_step,
+                volume_max=r.volume_max,
+                lot_for_base=lot_for_base,
+                usd_for_base_lot=usd_for_base_lot,
+                usd_diff_to_base=usd_diff_to_base,
+                error=r.error,
+                usd_pair_error=r.usd_pair_error,
+            )
+        )
+
+    return adjusted
 
 
 def _resolve_usd_pair_candidates(currency: str) -> list[str]:
@@ -202,6 +363,7 @@ def fetch_symbol_snapshot(symbol: str, *, module: Any = mt5) -> SymbolSnapshot:
         usd_per_lot=usd_per_lot,
         volume_min=getattr(info, "volume_min", None),
         volume_step=getattr(info, "volume_step", None),
+        volume_max=getattr(info, "volume_max", None),
         error=error,
         usd_pair_error=usd_pair_error,
     )
@@ -216,6 +378,9 @@ def collect_target_symbol_snapshots(
     symbols = get_enabled_target_symbols(settings_module=settings_module)
     if not symbols:
         return []
+
+    if BASE_SYMBOL not in symbols:
+        symbols = [BASE_SYMBOL, *symbols]
 
     config = load_mt5_config(env_file)
     initialized = False
@@ -232,7 +397,8 @@ def collect_target_symbol_snapshots(
                 f"MT5 initialize failed. last_error={_safe_last_error(module)}"
             )
 
-        return [fetch_symbol_snapshot(symbol, module=module) for symbol in symbols]
+        rows = [fetch_symbol_snapshot(symbol, module=module) for symbol in symbols]
+        return adjust_lots_to_base(rows)
     finally:
         if initialized:
             module.shutdown()
@@ -249,11 +415,17 @@ def _format_table(rows: list[SymbolSnapshot]) -> str:
         "usd_per_lot",
         "min_lot",
         "lot_step",
+        "lot_for_base",
+        "usd_for_base_lot",
+        "usd_diff_to_base",
     ]
 
     def s(v: Any) -> str:
         if v is None:
             return ""
+
+        if isinstance(v, float):
+            return f"{v:.10g}"
         return str(v)
 
     data = [
@@ -267,6 +439,9 @@ def _format_table(rows: list[SymbolSnapshot]) -> str:
             s(r.usd_per_lot),
             s(r.volume_min),
             s(r.volume_step),
+            s(r.lot_for_base),
+            s(r.usd_for_base_lot),
+            s(r.usd_diff_to_base),
         ]
         for r in rows
     ]
@@ -287,7 +462,7 @@ def _format_table(rows: list[SymbolSnapshot]) -> str:
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
-            "Connect to MT5 and print target symbols info (sell/contract size/currency/usd pair/min lot/lot step)"
+            "Connect to MT5 and print target symbols info (including USD per lot and lot adjusted to XAUUSD 0.01 lot base)"
         )
     )
     parser.add_argument(

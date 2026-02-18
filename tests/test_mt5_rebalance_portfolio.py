@@ -209,6 +209,7 @@ class TestMt5RebalancePortfolio(unittest.TestCase):
             text = slack_mock.call_args.args[0]
             self.assertIn("[rebalance] tp_check", text)
             self.assertIn("AAA", text)
+            self.assertIn("tp_px", text)
             self.assertIn("actions:", text)
 
             conn = sqlite3.connect(str(db_path))
@@ -223,6 +224,202 @@ class TestMt5RebalancePortfolio(unittest.TestCase):
                     (run_id, "AAA"),
                 )
                 self.assertEqual(cur.fetchone()[0], 1)
+
+                cur.execute(
+                    "SELECT tp_stage, tp_price_1 FROM daily_tp_reentry_state WHERE ymd=? AND portfolio_run_id=? AND symbol=?",
+                    (TEST_YMD, run_id, "AAA"),
+                )
+                row = cur.fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(int(row[0]), 1)
+                self.assertAlmostEqual(float(row[1]), 102.0, places=6)
+            finally:
+                conn.close()
+
+
+    def test_rebalance_does_not_duplicate_hedge_when_mt5_already_has_rebalance_positions(self) -> None:
+        """If MT5 already has hedge positions (comment starts with rebalance_),
+        rebalance should not place duplicated opposite trades even if DB state is not updated.
+        """
+
+        with tempfile.TemporaryDirectory() as d:
+            db_path = Path(d) / "portfolio.sqlite3"
+            initialize_db(db_path)
+
+            upsert_daily_pv_tpv(
+                ymd=TEST_YMD,
+                equity=10_000.0,
+                pv=60_000.0,
+                tpv=45_000.0,
+                pv_leverage=5.0,
+                leverage=1.0,
+                tpv_leverage=1.3,
+                fetched_at=FETCHED_AT,
+                db_path=db_path,
+            )
+            upsert_daily_symbol_price(
+                ymd=TEST_YMD,
+                symbol="AAA",
+                sell=100.0,
+                fetched_at=FETCHED_AT,
+                db_path=db_path,
+            )
+            upsert_daily_atr(
+                ymd=TEST_YMD,
+                symbol="AAA",
+                atr=2.0,
+                atr_pct=2.0,
+                time_frame=4,
+                atr_period=14,
+                fetched_at=FETCHED_AT,
+                db_path=db_path,
+            )
+
+            rows = [
+                SymbolSnapshot(
+                    symbol="AAA",
+                    exists=True,
+                    sell=100.0,
+                    atr=2.0,
+                    atr_pct=2.0,
+                    volume_min=0.01,
+                    volume_step=0.01,
+                    volume_max=100.0,
+                )
+            ]
+            plan = [
+                PlannedPosition(
+                    symbol="AAA",
+                    lot=1.0,
+                    direction="BUY",
+                    atr_pct=2.0,
+                    weight=1.0,
+                    risk_usd=0.0,
+                    risk_per_lot_at_1atr=None,
+                    ideal_lot=None,
+                    volume_min=0.01,
+                    volume_step=0.01,
+                    volume_max=100.0,
+                    usd_per_lot=100_000.0,
+                    usd_nominal=100_000.0,
+                    reason=None,
+                )
+            ]
+            run_id, _ = persist_initial_portfolio_run(
+                rows,
+                plan,
+                db_path=db_path,
+                created_at="2026-02-16T00:00:00+00:00",
+                time_frame=4,
+                atr_period=14,
+                tpv_leverage=5.0,
+                risk_pct=0.01,
+                equity=10_000.0,
+                tpv=160_000.0,
+                weights_title="w",
+                mt5_order_comment="initial_portfolio",
+            )
+
+            fake_settings = SimpleNamespace(
+                PV_LEVERAGE=5.0,
+                CIRCUIT_BREAKER_THRESHOLD=0.5,
+                TP_ATR_1ST=1.0,
+                TP_ATR_2ND=1.5,
+                TP_ATR_3RD=1.9,
+                TP_AMOUNT_1ST=0.5,
+                TP_AMOUNT_2ND=0.3,
+                TP_AMOUNT_3RD=0.2,
+            )
+
+            class FakeMt5:
+                POSITION_TYPE_BUY = 0
+                POSITION_TYPE_SELL = 1
+                ORDER_TYPE_BUY = 0
+                ORDER_TYPE_SELL = 1
+                TRADE_ACTION_DEAL = 2
+                ORDER_TIME_GTC = 3
+                ORDER_FILLING_IOC = 4
+
+                def __init__(self):
+                    self.shutdown_called = False
+
+                def initialize(self, **kwargs):
+                    return True
+
+                def shutdown(self):
+                    self.shutdown_called = True
+
+                def account_info(self):
+                    return SimpleNamespace(equity=10_000.0)
+
+                def positions_get(self):
+                    return [
+                        # base position (not rebalance_ comment)
+                        SimpleNamespace(
+                            symbol="AAA",
+                            type=self.POSITION_TYPE_BUY,
+                            volume=1.0,
+                            price_open=100.0,
+                            comment="initial_portfolio",
+                        ),
+                        # already-hedged position (rebalance_ comment)
+                        SimpleNamespace(
+                            symbol="AAA",
+                            type=self.POSITION_TYPE_SELL,
+                            volume=0.50,
+                            price_open=102.0,
+                            comment="rebalance_tp_hedge",
+                        ),
+                    ]
+
+                def symbol_select(self, symbol, enable):
+                    return True
+
+                def symbol_info_tick(self, symbol):
+                    return SimpleNamespace(bid=102.0, ask=102.01)
+
+                def symbol_info(self, symbol):
+                    return SimpleNamespace(filling_mode=self.ORDER_FILLING_IOC)
+
+            fake = FakeMt5()
+
+            with patch(
+                "infrastructure.mt5.rebalance_portfolio.load_mt5_config",
+                return_value=SimpleNamespace(path="p", login=1, password="x", server="s", portable=False),
+            ), patch(
+                "infrastructure.mt5.rebalance_portfolio.today_ymd_local",
+                return_value=TEST_YMD,
+            ):
+                from infrastructure.mt5.rebalance_portfolio import rebalance_portfolio_once
+
+                out = rebalance_portfolio_once(
+                    env_file="dummy.env",
+                    db_path=db_path,
+                    settings_module=fake_settings,
+                    module=fake,
+                    trade=False,
+                    slack_notify=False,
+                )
+
+            self.assertFalse(out["triggered"])
+            self.assertEqual(out["actions"], [])
+            self.assertTrue(fake.shutdown_called)
+
+            conn = sqlite3.connect(str(db_path))
+            try:
+                cur = conn.cursor()
+                cur.execute("SELECT COUNT(*) FROM rebalance_runs")
+                self.assertEqual(cur.fetchone()[0], 1)
+                cur.execute("SELECT COUNT(*) FROM rebalance_actions")
+                self.assertEqual(cur.fetchone()[0], 0)
+                cur.execute(
+                    "SELECT tp_stage, hedged_volume FROM rebalance_state WHERE portfolio_run_id=? AND symbol=?",
+                    (run_id, "AAA"),
+                )
+                row = cur.fetchone()
+                self.assertIsNotNone(row)
+                self.assertEqual(int(row[0]), 1)
+                self.assertAlmostEqual(float(row[1]), 0.50, places=6)
             finally:
                 conn.close()
 

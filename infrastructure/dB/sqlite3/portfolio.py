@@ -235,69 +235,6 @@ def read_latest_portfolio_run(db_path: os.PathLike[str] | str) -> Optional[dict[
     return read_portfolio_run(db_path, latest)
 
 
-def read_symbol_snapshots_for_run(
-    db_path: os.PathLike[str] | str, run_id: int
-) -> dict[str, SymbolSnapshot]:
-    conn = connect(db_path)
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT
-                symbol,
-                exists_flag,
-                sell,
-                atr,
-                atr_pct,
-                contract_size,
-                currency_profit,
-                usd_pair_symbol,
-                usd_pair_sell,
-                usd_per_lot,
-                volume_min,
-                volume_step,
-                volume_max,
-                lot_for_base,
-                usd_for_base_lot,
-                usd_diff_to_base,
-                error,
-                usd_pair_error,
-                atr_error
-            FROM symbol_snapshots
-            WHERE run_id=?
-            """,
-            (int(run_id),),
-        )
-        rows = cur.fetchall()
-        out: dict[str, SymbolSnapshot] = {}
-        for r in rows:
-            sym = str(r[0])
-            out[sym] = SymbolSnapshot(
-                symbol=sym,
-                exists=bool(int(r[1] or 0)),
-                sell=float(r[2]) if r[2] is not None else None,
-                atr=float(r[3]) if r[3] is not None else None,
-                atr_pct=float(r[4]) if r[4] is not None else None,
-                contract_size=float(r[5]) if r[5] is not None else None,
-                currency_profit=str(r[6]) if r[6] is not None else None,
-                usd_pair_symbol=str(r[7]) if r[7] is not None else None,
-                usd_pair_sell=float(r[8]) if r[8] is not None else None,
-                usd_per_lot=float(r[9]) if r[9] is not None else None,
-                volume_min=float(r[10]) if r[10] is not None else None,
-                volume_step=float(r[11]) if r[11] is not None else None,
-                volume_max=float(r[12]) if r[12] is not None else None,
-                lot_for_base=float(r[13]) if r[13] is not None else None,
-                usd_for_base_lot=float(r[14]) if r[14] is not None else None,
-                usd_diff_to_base=float(r[15]) if r[15] is not None else None,
-                error=str(r[16]) if r[16] is not None else None,
-                usd_pair_error=str(r[17]) if r[17] is not None else None,
-                atr_error=str(r[18]) if r[18] is not None else None,
-            )
-        return out
-    finally:
-        conn.close()
-
-
 def read_planned_positions_for_run(
     db_path: os.PathLike[str] | str, run_id: int
 ) -> dict[str, dict[str, Any]]:

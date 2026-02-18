@@ -1,5 +1,5 @@
 PV_LEVERAGE = 5 #Portfolio Value を有効証拠金の何倍にするか
-TPV_LEVERAGE = 1.3 # PV_LEVERAGEに対し何倍の値をTargetPortfolioValueとするか
+TPV_LEVERAGE = 0.9 # PV_LEVERAGEに対し何倍の値をTargetPortfolioValueとするか
 
 #
 CIRCUIT_BREAKER_THRESHOLD = 0.5
@@ -13,6 +13,16 @@ TP_ATR_3RD=1.9
 TP_AMOUNT_1ST = 0.5
 TP_AMOUNT_2ND = 0.3
 TP_AMOUNT_3RD = 0.2
+
+# 部分利確後どの程度価格が下がったら追加ポジションを持つかのATR%の基準
+REENTRY_ATR_1ST=0.8
+REENTRY_ATR_2ND=1.2
+REENTRY_ATR_3RD=1.6
+
+# 追加ポジションのLot量
+REENTRY_AMOUNT_1ST = 0.5
+REENTRY_AMOUNT_2ND = 0.3
+REENTRY_AMOUNT_3RD = 0.2
 
 # TPV算出時に用いる実効レバレッジ（デフォルト=1.0で従来のTPV=PV*TPV_LEVERAGEと一致）
 LEVERAGE = 1.0

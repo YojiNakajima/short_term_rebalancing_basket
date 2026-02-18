@@ -16,6 +16,12 @@ from infrastructure.dB.sqlite3.daily_metrics import (
     read_daily_pv_tpv,
     read_daily_symbol_price,
 )
+from infrastructure.dB.sqlite3.daily_tp_reentry import (
+    DailyTpReentryState,
+    ensure_daily_tp_reentry_state_rows,
+    read_daily_tp_reentry_state_map,
+    upsert_daily_tp_reentry_state,
+)
 from infrastructure.dB.sqlite3.global_settings import (
     read_global_running,
     set_global_running,
@@ -355,18 +361,37 @@ def _target_hedge_ratio(stage: int, *, amounts: tuple[float, float, float]) -> f
     return max(0.0, min(1.0, a1 + a2 + a3))
 
 
-def _compute_drift(
-    *,
-    current_weights: dict[str, float],
-    target_weights: dict[str, float],
-) -> float:
-    s = 0.0
-    keys = set(target_weights.keys()) | set(current_weights.keys())
-    for k in keys:
-        tw = float(target_weights.get(k, 0.0) or 0.0)
-        cw = float(current_weights.get(k, 0.0) or 0.0)
-        s += abs(cw - tw)
-    return 0.5 * s
+def _stage_from_hedge_ratio(
+    hedge_ratio: Optional[float], *, amounts: tuple[float, float, float]
+) -> int:
+    """Infer TP stage (0..3) from current (or observed) hedge ratio.
+
+    This is used as a safety net to prevent duplicated hedge orders when the DB state
+    is missing/out-of-sync but MT5 already has hedge positions (rebalance_ comment).
+    """
+
+    if hedge_ratio is None:
+        return 0
+    try:
+        r = float(hedge_ratio)
+    except Exception:
+        return 0
+    if not math.isfinite(r) or r <= 0:
+        return 0
+
+    a1, a2, a3 = (float(amounts[0]), float(amounts[1]), float(amounts[2]))
+    th1 = max(0.0, min(1.0, a1))
+    th2 = max(0.0, min(1.0, a1 + a2))
+    th3 = max(0.0, min(1.0, a1 + a2 + a3))
+    eps = 1e-9
+
+    if th3 > 0 and r + eps >= th3:
+        return 3
+    if th2 > 0 and r + eps >= th2:
+        return 2
+    if th1 > 0 and r + eps >= th1:
+        return 1
+    return 0
 
 
 def _fmt_or_dash(v: Any, *, digits: int = 2) -> str:
@@ -384,44 +409,6 @@ def _fmt_or_dash(v: Any, *, digits: int = 2) -> str:
 def _fmt_pct_or_dash(v: Any, *, digits: int = 2) -> str:
     s = _fmt_or_dash(v, digits=digits)
     return "-" if s == "-" else f"{s}%"
-
-
-def _box_table(
-    header: list[str],
-    rows: list[list[str]],
-    *,
-    right_align: Optional[set[int]] = None,
-) -> str:
-    right_align = set(right_align or set())
-
-    all_rows = [header] + rows
-    widths = [0] * len(header)
-    for r in all_rows:
-        for i, c in enumerate(r):
-            widths[i] = max(widths[i], len(str(c)))
-
-    def hline(left: str, mid: str, right: str) -> str:
-        parts = ["─" * (w + 2) for w in widths]
-        return left + mid.join(parts) + right
-
-    def fmt_row(r: list[str]) -> str:
-        cells = []
-        for i, c in enumerate(r):
-            t = str(c)
-            if i in right_align:
-                cells.append(t.rjust(widths[i]))
-            else:
-                cells.append(t.ljust(widths[i]))
-        return "│ " + " │ ".join(cells) + " │"
-
-    out = []
-    out.append(hline("┌", "┬", "┐"))
-    out.append(fmt_row(header))
-    out.append(hline("├", "┼", "┤"))
-    for r in rows:
-        out.append(fmt_row(r))
-    out.append(hline("└", "┴", "┘"))
-    return "\n".join(out)
 
 
 def _plain_table(
@@ -459,18 +446,6 @@ def _plain_table(
     for r in rows:
         out.append(fmt_row(r))
     return "\n".join(out)
-
-
-def _next_tp_threshold_r(r: Optional[float]) -> Optional[float]:
-    if r is None or not math.isfinite(r):
-        return 1.0
-    if r < 1.0:
-        return 1.0
-    if r < 1.6:
-        return 1.6
-    if r < 2.4:
-        return 2.4
-    return None
 
 
 def _settings_float(settings_module: Any, name: str) -> float:
@@ -526,6 +501,20 @@ def _rebalance_portfolio_once_v2(
     )
     state_map, _ = read_rebalance_state_map(
         portfolio_run_id,
+        env_file=env_file,
+        db_path=resolved_db_path,
+    )
+
+    ensure_daily_tp_reentry_state_rows(
+        ymd=ymd,
+        portfolio_run_id=portfolio_run_id,
+        symbols=symbols,
+        env_file=env_file,
+        db_path=resolved_db_path,
+    )
+    tp_state_map, _ = read_daily_tp_reentry_state_map(
+        ymd=ymd,
+        portfolio_run_id=portfolio_run_id,
         env_file=env_file,
         db_path=resolved_db_path,
     )
@@ -922,8 +911,42 @@ def _rebalance_portfolio_once_v2(
                     stage_reached = _tp_stage_from_r(r, thresholds=tp_thresholds)
 
             prev_state = state_map.get(str(sym))
-            prev_stage = int(prev_state.tp_stage) if prev_state is not None else 0
-            prev_hedged = float(prev_state.hedged_volume) if prev_state is not None else 0.0
+            prev_stage_db = int(prev_state.tp_stage) if prev_state is not None else 0
+            prev_hedged_db = float(prev_state.hedged_volume) if prev_state is not None else 0.0
+
+            # Safety net: if MT5 already has hedge positions (rebalance_ comment) but
+            # DB state is missing/out-of-sync (e.g., portfolio_run_id changed or prior
+            # persistence failed), do not place duplicated hedge orders.
+            observed_hedged = float(exp.hedge_volume)
+            observed_stage = 0
+            if float(exp.base_volume) > 0 and observed_hedged > 0:
+                observed_stage = _stage_from_hedge_ratio(
+                    observed_hedged / float(exp.base_volume), amounts=tp_amounts
+                )
+
+            prev_stage = max(int(prev_stage_db), int(observed_stage))
+            prev_hedged = max(float(prev_hedged_db), float(observed_hedged))
+
+            if (
+                int(prev_stage) != int(prev_stage_db)
+                or float(prev_hedged) != float(prev_hedged_db)
+            ):
+                ts = _now_utc_iso()
+                reconciled = RebalanceState(
+                    portfolio_run_id=int(portfolio_run_id),
+                    symbol=str(sym),
+                    tp_stage=int(prev_stage),
+                    hedged_volume=float(prev_hedged),
+                    last_peak_price=None,
+                    updated_at=ts,
+                )
+                # Persist reconciliation so that subsequent runs don't depend solely
+                # on MT5 position comments.
+                upsert_rebalance_state(reconciled, env_file=env_file, db_path=resolved_db_path)
+                state_map[str(sym)] = reconciled
+
+            tp_state = tp_state_map.get(str(sym))
+            tp_stage_today = int(tp_state.tp_stage) if tp_state is not None else 0
 
             new_stage = prev_stage + 1 if stage_reached > prev_stage else prev_stage
             target_ratio = _target_hedge_ratio(new_stage, amounts=tp_amounts)
@@ -986,18 +1009,80 @@ def _rebalance_portfolio_once_v2(
                     db_path=resolved_db_path,
                 )
 
+                # Persist per-day TP history (stage + price at which stage was reached)
+                # so that later rebalance runs in the same day can show it.
+                if tp_state is None:
+                    tp_state = DailyTpReentryState(
+                        ymd=str(ymd),
+                        portfolio_run_id=int(portfolio_run_id),
+                        symbol=str(sym),
+                        tp_stage=0,
+                        tp_price_1=None,
+                        tp_price_2=None,
+                        tp_price_3=None,
+                        reentry_done_1=False,
+                        reentry_done_2=False,
+                        reentry_done_3=False,
+                        reentry_price_1=None,
+                        reentry_price_2=None,
+                        reentry_price_3=None,
+                        updated_at=_now_utc_iso(),
+                    )
+
+                tp_price_1 = tp_state.tp_price_1
+                tp_price_2 = tp_state.tp_price_2
+                tp_price_3 = tp_state.tp_price_3
+                if price_now is not None and math.isfinite(float(price_now)):
+                    if int(new_stage) == 1 and tp_price_1 is None:
+                        tp_price_1 = float(price_now)
+                    elif int(new_stage) == 2 and tp_price_2 is None:
+                        tp_price_2 = float(price_now)
+                    elif int(new_stage) == 3 and tp_price_3 is None:
+                        tp_price_3 = float(price_now)
+
+                tp_stage_today = max(tp_stage_today, int(new_stage))
+                tp_state = DailyTpReentryState(
+                    ymd=str(ymd),
+                    portfolio_run_id=int(portfolio_run_id),
+                    symbol=str(sym),
+                    tp_stage=int(tp_stage_today),
+                    tp_price_1=tp_price_1,
+                    tp_price_2=tp_price_2,
+                    tp_price_3=tp_price_3,
+                    reentry_done_1=bool(tp_state.reentry_done_1),
+                    reentry_done_2=bool(tp_state.reentry_done_2),
+                    reentry_done_3=bool(tp_state.reentry_done_3),
+                    reentry_price_1=tp_state.reentry_price_1,
+                    reentry_price_2=tp_state.reentry_price_2,
+                    reentry_price_3=tp_state.reentry_price_3,
+                    updated_at=_now_utc_iso(),
+                )
+                upsert_daily_tp_reentry_state(tp_state, env_file=env_file, db_path=resolved_db_path)
+                tp_state_map[str(sym)] = tp_state
+
+            tp_price_today = None
+            if tp_state is not None:
+                if int(tp_stage_today) == 1:
+                    tp_price_today = tp_state.tp_price_1
+                elif int(tp_stage_today) == 2:
+                    tp_price_today = tp_state.tp_price_2
+                elif int(tp_stage_today) == 3:
+                    tp_price_today = tp_state.tp_price_3
+
             table_rows.append(
                 [
                     str(sym),
                     str(base_dir),
                     _fmt_or_dash(exp.base_volume, digits=2),
                     _fmt_or_dash(prev_hedged, digits=2),
-                    _fmt_or_dash(ref_price, digits=5),
-                    _fmt_or_dash(price_now, digits=5),
+                    _fmt_or_dash(ref_price, digits=2),
+                    _fmt_or_dash(price_now, digits=2),
                     _fmt_pct_or_dash(diff_pct, digits=2),
                     _fmt_pct_or_dash(atr_pct, digits=2),
                     _fmt_or_dash(r, digits=2),
                     f"{prev_stage}->{new_stage}",
+                    str(int(tp_stage_today)),
+                    _fmt_or_dash(tp_price_today, digits=2),
                     _fmt_or_dash(to_hedge_rounded, digits=2),
                 ]
             )
@@ -1024,8 +1109,26 @@ def _rebalance_portfolio_once_v2(
         if actions:
             persist_rebalance_actions(run_id, actions, env_file=env_file, db_path=resolved_db_path)
 
-        header = ["sym", "dir", "base", "hedged", "ref", "now", "diff%", "ATR%", "R", "stage", "hedge"]
-        table = _plain_table(header, table_rows, right_align={2, 3, 4, 5, 6, 7, 8, 10}) if table_rows else "(none)"
+        header = [
+            "sym",
+            "dir",
+            "base",
+            "hedged",
+            "ref",
+            "now",
+            "diff%",
+            "ATR%",
+            "R",
+            "stage",
+            "tp",
+            "tp_px",
+            "hedge",
+        ]
+        table = (
+            _plain_table(header, table_rows, right_align={2, 3, 4, 5, 6, 7, 8, 10, 11, 12})
+            if table_rows
+            else "(none)"
+        )
 
         actions_text = "(none)"
         if actions:
@@ -1079,13 +1182,10 @@ def rebalance_portfolio_once(
     module: Any = mt5,
     trade: bool = False,
     slack_notify: bool = True,
-    tpv_return_threshold: float = 0.008,
-    drift_threshold: float = 0.08,
-    max_contrib_threshold: float = 0.006,
     log_path: Optional[os.PathLike[str] | str] = None,
 ) -> dict[str, Any]:
     # New implementation (2026-02): delegate to v2.
-    # Keep legacy parameters for backwards compatibility with existing code/tests.
+    # NOTE: Legacy implementation was removed; this wrapper remains as the stable entry point.
     return _rebalance_portfolio_once_v2(
         env_file=env_file,
         db_path=db_path,
@@ -1095,616 +1195,6 @@ def rebalance_portfolio_once(
         slack_notify=slack_notify,
         log_path=log_path,
     )
-    if False:  # legacy implementation (kept for reference)
-        """
-    resolved_db_path = Path(db_path) if db_path is not None else load_sqlite_db_path(env_file)
-    initialize_db(resolved_db_path)
-
-    log_path_resolved = _resolve_rebalance_log_path(log_path, settings_module=settings_module)
-
-    latest_run = read_latest_portfolio_run(resolved_db_path)
-    if latest_run is None:
-        raise RuntimeError(f"No portfolio_runs found in db: {resolved_db_path}")
-
-    portfolio_run_id = int(latest_run["id"])
-    tpv_ref = float(latest_run.get("tpv") or 0.0)
-    if tpv_ref <= 0:
-        raise RuntimeError("Invalid TPV_ref (portfolio_runs.tpv). Build initial portfolio first.")
-
-    global_running = read_global_running(env_file=env_file, db_path=resolved_db_path, default=True)
-    if not bool(global_running):
-        mode_label = "TRADE" if trade else "DRY-RUN"
-        text = "\n".join(
-            [
-                f"[rebalance] skipped ({mode_label})",
-                "reason=global_running=false",
-                f"portfolio_run_id={portfolio_run_id} tpv_ref={tpv_ref:.2f}",
-                "",
-                "symbols:",
-                "(skipped)",
-                "",
-                "actions:",
-                "```(none)```",
-            ]
-        )
-
-        # Persist a run record for audit.
-        try:
-            create_rebalance_run(
-                portfolio_run_id=portfolio_run_id,
-                tpv_ref=tpv_ref,
-                tpv_now=None,
-                tpv_return=None,
-                drift=None,
-                max_contrib=None,
-                triggered=False,
-                dry_run=not bool(trade),
-                error="SKIPPED: global_running=false",
-                metrics={
-                    "portfolio_run_id": portfolio_run_id,
-                    "tpv_ref": tpv_ref,
-                    "skipped": True,
-                    "global_running": False,
-                    "reason": "global_running=false",
-                },
-                env_file=env_file,
-                db_path=resolved_db_path,
-            )
-        except Exception:
-            # ignore audit persistence failures
-            pass
-
-        _append_run_log(text=text, log_path=log_path_resolved)
-        if slack_notify:
-            try:
-                send_slack_message(text, env_file=env_file)
-            except Exception:
-                pass
-
-        return {
-            "db_path": str(resolved_db_path),
-            "portfolio_run_id": portfolio_run_id,
-            "skipped": True,
-            "global_running": False,
-            "triggered": False,
-            "actions": [],
-        }
-
-    plan_map = read_planned_positions_for_run(resolved_db_path, portfolio_run_id)
-    snap_map = read_symbol_snapshots_for_run(resolved_db_path, portfolio_run_id)
-    symbols = sorted(plan_map.keys())
-
-    ensure_rebalance_state_rows(
-        portfolio_run_id,
-        symbols,
-        env_file=env_file,
-        db_path=resolved_db_path,
-    )
-    state_map, _ = read_rebalance_state_map(
-        portfolio_run_id,
-        env_file=env_file,
-        db_path=resolved_db_path,
-    )
-
-    config = load_mt5_config(env_file)
-    initialized = False
-    positions: list[Any] = []
-    actions: list[dict[str, Any]] = []
-    metrics: dict[str, Any] = {}
-    error: Optional[str] = None
-    text: Optional[str] = None
-    triggered: bool = False
-
-    try:
-        initialized = bool(
-            module.initialize(
-                path=config.path,
-                login=config.login,
-                password=config.password,
-                server=config.server,
-                portable=config.portable,
-            )
-        )
-        if not initialized:
-            raise Mt5ConnectionError(f"MT5 initialize failed. last_error={_safe_last_error(module)}")
-
-        raw_positions = module.positions_get()
-        if raw_positions:
-            positions = list(raw_positions)
-
-        if not positions:
-            mode_label = "TRADE" if trade else "DRY-RUN"
-            text = "\n".join(
-                [
-                    f"[rebalance] skipped ({mode_label})",
-                    "reason=no_positions",
-                    f"portfolio_run_id={portfolio_run_id} tpv_ref={tpv_ref:.2f}",
-                    "",
-                    "positions:",
-                    "```(none)```",
-                    "",
-                    "actions:",
-                    "```(none)```",
-                ]
-            )
-
-            # Persist a run record for audit.
-            try:
-                create_rebalance_run(
-                    portfolio_run_id=portfolio_run_id,
-                    tpv_ref=tpv_ref,
-                    tpv_now=None,
-                    tpv_return=None,
-                    drift=None,
-                    max_contrib=None,
-                    triggered=False,
-                    dry_run=not bool(trade),
-                    error="SKIPPED: no_positions",
-                    metrics={
-                        "portfolio_run_id": portfolio_run_id,
-                        "tpv_ref": tpv_ref,
-                        "skipped": True,
-                        "reason": "no_positions",
-                        "positions_count": 0,
-                    },
-                    env_file=env_file,
-                    db_path=resolved_db_path,
-                )
-            except Exception:
-                pass
-
-            _append_run_log(text=text, log_path=log_path_resolved)
-            if slack_notify:
-                try:
-                    send_slack_message(text, env_file=env_file)
-                except Exception:
-                    pass
-
-            return {
-                "db_path": str(resolved_db_path),
-                "portfolio_run_id": portfolio_run_id,
-                "skipped": True,
-                "reason": "no_positions",
-                "triggered": False,
-                "actions": [],
-            }
-
-        exposures: dict[str, SymbolExposure] = {}
-        current_notional: dict[str, float] = {}
-        current_prices: dict[str, float] = {}
-        target_weights: dict[str, float] = {}
-        current_weights: dict[str, float] = {}
-        contribs: dict[str, float] = {}
-
-        for sym in symbols:
-            p = plan_map.get(sym) or {}
-            target_weights[sym] = float(p.get("weight") or 0.0)
-
-        for sym in symbols:
-            p = plan_map.get(sym) or {}
-            base_direction = str(p.get("direction") or "BUY").upper()
-            exp = _aggregate_positions_for_symbol(
-                positions,
-                symbol=sym,
-                base_direction=base_direction,
-                module=module,
-            )
-            exposures[sym] = exp
-
-            sell = _fetch_sell_price(sym, module=module)
-            if sell is not None:
-                current_prices[sym] = float(sell)
-
-            snap = snap_map.get(sym)
-            usd_per_lot_now = None
-            if sell is not None and snap is not None:
-                usd_pair_sell = None
-                if snap.usd_pair_symbol:
-                    usd_pair_sell = _fetch_sell_price(str(snap.usd_pair_symbol), module=module)
-                usd_per_lot_now = _calc_usd_per_lot(
-                    sell=sell,
-                    contract_size=snap.contract_size,
-                    currency_profit=snap.currency_profit,
-                    usd_pair_symbol=snap.usd_pair_symbol,
-                    usd_pair_sell=usd_pair_sell,
-                )
-
-            # Fallback to reference usd_per_lot if live calc fails.
-            if usd_per_lot_now is None and snap is not None and snap.usd_per_lot is not None:
-                usd_per_lot_now = float(snap.usd_per_lot)
-
-            net_abs_lot = abs(float(exp.net_volume_signed))
-            nominal = None
-            if usd_per_lot_now is not None and math.isfinite(usd_per_lot_now):
-                nominal = net_abs_lot * float(usd_per_lot_now)
-            current_notional[sym] = float(nominal or 0.0)
-
-            contribs[sym] = float(exp.profit) / float(tpv_ref)
-
-        tpv_now = float(sum(max(v, 0.0) for v in current_notional.values()))
-        tpv_return = (tpv_now - tpv_ref) / tpv_ref
-
-        for sym, nom in current_notional.items():
-            if tpv_now > 0 and nom > 0:
-                current_weights[sym] = float(nom) / tpv_now
-            else:
-                current_weights[sym] = 0.0
-
-        drift = _compute_drift(current_weights=current_weights, target_weights=target_weights)
-        max_contrib = max(contribs.values()) if contribs else 0.0
-
-        triggered = (
-            float(tpv_return) >= float(tpv_return_threshold)
-            and float(drift) >= float(drift_threshold)
-        ) or (
-            float(max_contrib) >= float(max_contrib_threshold)
-            and float(drift) >= float(drift_threshold)
-        )
-
-        metrics = {
-            "portfolio_run_id": portfolio_run_id,
-            "tpv_ref": tpv_ref,
-            "tpv_now": tpv_now,
-            "tpv_return": tpv_return,
-            "drift": drift,
-            "max_contrib": max_contrib,
-        }
-
-        # Persist run (even if not triggered) for audit.
-        rebalance_run_id, _ = create_rebalance_run(
-            portfolio_run_id=portfolio_run_id,
-            tpv_ref=tpv_ref,
-            tpv_now=tpv_now,
-            tpv_return=tpv_return,
-            drift=drift,
-            max_contrib=max_contrib,
-            triggered=bool(triggered),
-            dry_run=not bool(trade),
-            error=None,
-            metrics=metrics,
-            env_file=env_file,
-            db_path=resolved_db_path,
-        )
-
-        if triggered:
-            hedge_plan: list[PlannedPosition] = []
-
-            for sym in symbols:
-                exp = exposures.get(sym)
-                if exp is None:
-                    continue
-
-                snap = snap_map.get(sym)
-                if snap is None:
-                    continue
-
-                price_now = current_prices.get(sym)
-                if price_now is None:
-                    continue
-
-                atr_pct_ref = plan_map.get(sym, {}).get("atr_pct")
-                if atr_pct_ref is None:
-                    atr_pct_ref = snap.atr_pct
-
-                if exp.base_avg_entry is None or exp.base_volume <= 0:
-                    continue
-
-                diff_pct = _price_diff_pct(
-                    price_now=float(price_now),
-                    avg_entry=float(exp.base_avg_entry),
-                    base_direction=exp.base_direction,
-                )
-                r = _r_value(price_diff_pct=float(diff_pct or 0.0), atr_pct_ref=float(atr_pct_ref or 0.0))
-                stage_reached = _tp_stage_from_r(r)
-
-                prev_state = state_map.get(sym)
-                prev_stage = int(prev_state.tp_stage) if prev_state is not None else 0
-                new_stage = max(prev_stage, stage_reached)
-
-                # Update peak (directional) for future use.
-                last_peak = prev_state.last_peak_price if prev_state is not None else None
-                if exp.base_direction == "BUY":
-                    if last_peak is None or float(price_now) > float(last_peak):
-                        last_peak = float(price_now)
-                else:
-                    if last_peak is None or float(price_now) < float(last_peak):
-                        last_peak = float(price_now)
-
-                desired_ratio = _target_hedge_ratio(new_stage)
-                desired_hedge = float(exp.base_volume) * float(desired_ratio)
-                already_hedged = float(exp.hedge_volume)
-                to_hedge = max(0.0, desired_hedge - already_hedged)
-
-                # Round to volume constraints.
-                to_hedge_rounded = 0.0
-                if to_hedge > 0:
-                    to_hedge_rounded = _round_to_volume_constraints(
-                        to_hedge,
-                        volume_min=snap.volume_min,
-                        volume_step=snap.volume_step,
-                        volume_max=snap.volume_max,
-                    )
-                min_lot = float(snap.volume_min or 0.0)
-                if to_hedge_rounded < min_lot:
-                    to_hedge_rounded = 0.0
-
-                if to_hedge_rounded > 0:
-                    hedge_direction = _opposite_direction(exp.base_direction)
-                    comment = f"rebalance_tp{new_stage}"
-                    hedge_plan.append(
-                        PlannedPosition(
-                            symbol=sym,
-                            atr_pct=float(atr_pct_ref) if atr_pct_ref is not None else None,
-                            weight=None,
-                            risk_usd=None,
-                            risk_per_lot_at_1atr=None,
-                            ideal_lot=None,
-                            lot=float(to_hedge_rounded),
-                            direction=hedge_direction,
-                            volume_min=snap.volume_min,
-                            volume_step=snap.volume_step,
-                            volume_max=snap.volume_max,
-                            usd_per_lot=snap.usd_per_lot,
-                            usd_nominal=None,
-                            reason=None,
-                        )
-                    )
-
-                    actions.append(
-                        {
-                            "symbol": sym,
-                            "action": "HEDGE",
-                            "direction": hedge_direction,
-                            "volume": float(to_hedge_rounded),
-                            "stage": int(new_stage),
-                            "r": float(r) if r is not None else None,
-                            "price": float(price_now),
-                            "atr_pct_ref": float(atr_pct_ref) if atr_pct_ref is not None else None,
-                            "reason": "tp_stage_reached",
-                            "comment": comment,
-                        }
-                    )
-
-                # Persist updated state (even if no action, stage/peak may advance).
-                new_state = RebalanceState(
-                    portfolio_run_id=int(portfolio_run_id),
-                    symbol=str(sym),
-                    tp_stage=int(new_stage),
-                    hedged_volume=float(already_hedged + float(to_hedge_rounded)),
-                    last_peak_price=float(last_peak) if last_peak is not None else None,
-                    updated_at=_now_utc_iso(),
-                )
-                upsert_rebalance_state(
-                    new_state,
-                    env_file=env_file,
-                    db_path=resolved_db_path,
-                )
-
-            if actions:
-                persist_rebalance_actions(
-                    rebalance_run_id,
-                    actions,
-                    env_file=env_file,
-                    db_path=resolved_db_path,
-                )
-
-            # Send hedge orders
-            requests = []
-            results = []
-            if hedge_plan:
-                requests = build_mt5_market_order_requests(
-                    hedge_plan,
-                    module=module,
-                    comment="rebalance_hedge",
-                )
-                # override per-order comment if provided in actions (best-effort)
-                for req in requests:
-                    sym = req.get("symbol")
-                    # pick the latest action comment
-                    c = None
-                    for a in reversed(actions):
-                        if a.get("symbol") == sym:
-                            c = a.get("comment")
-                            break
-                    if c:
-                        req["comment"] = str(c)
-
-                if trade:
-                    results = execute_mt5_market_orders(requests, module=module)
-
-        # Build text report for Slack + file log.
-        held_symbols = []
-        for sym in symbols:
-            exp = exposures.get(sym)
-            if exp is None:
-                continue
-            if float(exp.base_volume) > 0.0 or float(exp.hedge_volume) > 0.0:
-                held_symbols.append(sym)
-
-        atr_period = latest_run.get("atr_period")
-        if atr_period is None:
-            atr_period = getattr(settings_module, "ATR_PERIOD", None)
-        time_frame = latest_run.get("time_frame")
-        if time_frame is None:
-            time_frame = getattr(settings_module, "TIME_FRAME", None)
-
-        header = [
-            "sym",
-            "dir",
-            "base",
-            "hedge",
-            "PnL$",
-            "diff%",
-            "ATR%ref",
-            "ATR%now",
-            "R(ref)",
-            "stage",
-            "nextR",
-            "need%",
-        ]
-        table_rows: list[list[str]] = []
-
-        for sym in held_symbols:
-            exp = exposures.get(sym)
-            if exp is None:
-                continue
-
-            snap = snap_map.get(sym)
-            atr_pct_ref = plan_map.get(sym, {}).get("atr_pct")
-            if atr_pct_ref is None and snap is not None:
-                atr_pct_ref = snap.atr_pct
-
-            price_now = current_prices.get(sym)
-            diff_pct = None
-            r_ref = None
-            if price_now is not None and exp.base_avg_entry is not None:
-                diff_pct = _price_diff_pct(
-                    price_now=float(price_now),
-                    avg_entry=float(exp.base_avg_entry),
-                    base_direction=exp.base_direction,
-                )
-                r_ref = _r_value(
-                    price_diff_pct=float(diff_pct or 0.0),
-                    atr_pct_ref=float(atr_pct_ref or 0.0),
-                )
-
-            stage_reached = _tp_stage_from_r(r_ref)
-            prev_state = state_map.get(sym)
-            prev_stage = int(prev_state.tp_stage) if prev_state is not None else 0
-            stage_now = max(prev_stage, stage_reached)
-
-            next_r = _next_tp_threshold_r(r_ref)
-            need_pct = None
-            if (
-                next_r is not None
-                and diff_pct is not None
-                and atr_pct_ref is not None
-                and math.isfinite(float(atr_pct_ref))
-            ):
-                need_pct = (float(next_r) * float(atr_pct_ref)) - float(diff_pct)
-                if need_pct < 0:
-                    need_pct = 0.0
-
-            atr_now_pct = None
-            if atr_period is not None and time_frame is not None:
-                try:
-                    live = fetch_symbol_snapshot(
-                        sym,
-                        module=module,
-                        atr_period=int(atr_period),
-                        time_frame=time_frame,
-                    )
-                    atr_now_pct = live.atr_pct
-                except Exception:
-                    atr_now_pct = None
-
-            table_rows.append(
-                [
-                    str(sym),
-                    str(exp.base_direction),
-                    _fmt_or_dash(exp.base_volume, digits=2),
-                    _fmt_or_dash(exp.hedge_volume, digits=2),
-                    _fmt_or_dash(exp.profit, digits=2),
-                    _fmt_pct_or_dash(diff_pct, digits=2),
-                    _fmt_pct_or_dash(atr_pct_ref, digits=2),
-                    _fmt_pct_or_dash(atr_now_pct, digits=2),
-                    _fmt_or_dash(r_ref, digits=2),
-                    f"{prev_stage}->{stage_now}",
-                    _fmt_or_dash(next_r, digits=1) if next_r is not None else "-",
-                    _fmt_pct_or_dash(need_pct, digits=2),
-                ]
-            )
-
-        table = _plain_table(
-            header,
-            table_rows,
-            right_align={2, 3, 4, 5, 6, 7, 8, 10, 11},
-        )
-
-        actions_text = "(none)"
-        if actions:
-            actions_lines = []
-            for a in actions:
-                actions_lines.append(
-                    f"- {a['symbol']} {a['action']} {a['direction']} vol={a['volume']:.2f} stage={a.get('stage')} r={_fmt_or_dash(a.get('r'), digits=2)}"
-                )
-            actions_text = "\n".join(actions_lines)
-
-        mode_label = "TRADE" if trade else "DRY-RUN"
-        status_label = "triggered" if bool(triggered) else "not_triggered"
-        lines = [
-            f"[rebalance] {status_label} ({mode_label})",
-            f"portfolio_run_id={portfolio_run_id} tpv_ref={tpv_ref:.2f} tpv_now={tpv_now:.2f} tpv_return={tpv_return*100:.3f}%",
-            f"drift={drift*100:.2f}% (th={drift_threshold*100:.2f}%) max_contrib={max_contrib*100:.3f}%",
-            "",
-            "symbols:",
-            f"```{table}```" if table_rows else "(none)",
-            "",
-            "actions:",
-            f"```{actions_text}```",
-        ]
-        text = "\n".join(lines)
-
-        # Always write file log.
-        _append_run_log(text=text, log_path=log_path_resolved)
-
-        # Slack: keep noise low (notify only when triggered).
-        if slack_notify and bool(triggered):
-            send_slack_message(text, env_file=env_file)
-
-        return {
-            "db_path": str(resolved_db_path),
-            "portfolio_run_id": portfolio_run_id,
-            "metrics": metrics,
-            "triggered": bool(triggered),
-            "actions": actions,
-        }
-    except Exception as e:
-        error = f"{type(e).__name__}: {e}"
-        tb = traceback.format_exc()
-
-        mode_label = "TRADE" if trade else "DRY-RUN"
-        lines = [
-            f"[rebalance] error ({mode_label})",
-            f"error={error}",
-            "",
-            "traceback:",
-            f"```{tb}```",
-        ]
-        text = "\n".join(lines)
-
-        _append_run_log(text=text, log_path=log_path_resolved)
-        if slack_notify:
-            try:
-                send_slack_message(text, env_file=env_file)
-            except Exception:
-                pass
-
-        # Persist a failed run record.
-        create_rebalance_run(
-            portfolio_run_id=portfolio_run_id,
-            tpv_ref=tpv_ref if "tpv_ref" in locals() else None,
-            tpv_now=metrics.get("tpv_now") if metrics else None,
-            tpv_return=metrics.get("tpv_return") if metrics else None,
-            drift=metrics.get("drift") if metrics else None,
-            max_contrib=metrics.get("max_contrib") if metrics else None,
-            triggered=False,
-            dry_run=not bool(trade),
-            error=error,
-            metrics=metrics,
-            env_file=env_file,
-            db_path=resolved_db_path,
-        )
-        raise
-    finally:
-        if initialized:
-            try:
-                module.shutdown()
-            except Exception:
-                pass
-
-        """
-
 
 def main(argv: Optional[list[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Rebalance existing portfolio on MT5")

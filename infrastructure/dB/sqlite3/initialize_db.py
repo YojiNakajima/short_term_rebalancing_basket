@@ -234,12 +234,38 @@ def initialize_db(db_path: os.PathLike[str] | str) -> None:
                 FOREIGN KEY (rebalance_run_id) REFERENCES rebalance_runs(id) ON DELETE CASCADE
             );
 
+            -- --- Daily TP (partial take profit) & Re-entry state ---
+            -- ymd-scoped state so that multiple rebalance runs in the same day can share TP/Re-entry progress.
+            CREATE TABLE IF NOT EXISTS daily_tp_reentry_state (
+                ymd TEXT NOT NULL,
+                portfolio_run_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                tp_stage INTEGER NOT NULL DEFAULT 0,
+                tp_price_1 REAL,
+                tp_price_2 REAL,
+                tp_price_3 REAL,
+                reentry_done_1 INTEGER NOT NULL DEFAULT 0,
+                reentry_done_2 INTEGER NOT NULL DEFAULT 0,
+                reentry_done_3 INTEGER NOT NULL DEFAULT 0,
+                reentry_price_1 REAL,
+                reentry_price_2 REAL,
+                reentry_price_3 REAL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (ymd, portfolio_run_id, symbol),
+                FOREIGN KEY (portfolio_run_id) REFERENCES portfolio_runs(id) ON DELETE CASCADE
+            );
+
             CREATE INDEX IF NOT EXISTS idx_rebalance_runs_created_at
                 ON rebalance_runs(created_at);
             CREATE INDEX IF NOT EXISTS idx_rebalance_state_symbol
                 ON rebalance_state(symbol);
             CREATE INDEX IF NOT EXISTS idx_rebalance_actions_symbol
                 ON rebalance_actions(symbol);
+
+            CREATE INDEX IF NOT EXISTS idx_daily_tp_reentry_state_ymd
+                ON daily_tp_reentry_state(ymd);
+            CREATE INDEX IF NOT EXISTS idx_daily_tp_reentry_state_symbol
+                ON daily_tp_reentry_state(symbol);
             """
         )
 

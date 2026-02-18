@@ -175,6 +175,39 @@ class TestMt5SymbolsReport(unittest.TestCase):
         self.assertEqual(snap.usd_pair_sell, 1.1)
         self.assertAlmostEqual(snap.usd_per_lot or 0.0, 2.0 * 10.0 * 1.1)
 
+    def test_fetch_symbol_snapshot_sets_atr_when_requested(self) -> None:
+        module = Mock()
+        module.TIMEFRAME_H1 = 1
+        module.TIMEFRAME_H4 = 4
+
+        module.symbol_info.return_value = SimpleNamespace(
+            visible=True,
+            currency_profit="USD",
+            volume_min=0.01,
+            volume_step=0.01,
+            trade_contract_size=100.0,
+        )
+        module.symbol_info_tick.return_value = SimpleNamespace(bid=10.0)
+        module.copy_rates_from_pos.return_value = [
+            {"time": 1, "high": 105.0, "low": 95.0, "close": 100.0},
+            {"time": 2, "high": 106.0, "low": 96.0, "close": 102.0},
+            {"time": 3, "high": 104.0, "low": 97.0, "close": 101.0},
+        ]
+
+        # TR1 = max(106-96=10, |106-100|=6, |96-100|=4) = 10
+        # TR2 = max(104-97=7, |104-102|=2, |97-102|=5) = 7
+        # Wilder ATR(2) (no additional bars) = SMA(TR,2) = (10+7)/2 = 8.5
+        # ATR% = 100 * ATR / Close(last=101) = 8.415841584...
+        snap = fetch_symbol_snapshot(
+            "XAUUSD", module=module, atr_period=2, time_frame=1
+        )
+
+        self.assertTrue(snap.exists)
+        self.assertIsNone(snap.atr_error)
+        self.assertAlmostEqual(snap.atr or 0.0, 8.5)
+        self.assertAlmostEqual(snap.atr_pct or 0.0, (8.5 / 101.0) * 100.0)
+        module.copy_rates_from_pos.assert_called_once_with("XAUUSD", 1, 1, 52)
+
     def test_collect_target_symbol_snapshots_shuts_down(self) -> None:
         module = Mock()
         module.initialize.return_value = True
@@ -187,6 +220,7 @@ class TestMt5SymbolsReport(unittest.TestCase):
             trade_contract_size=1.0,
         )
         module.symbol_info_tick.return_value = SimpleNamespace(bid=1.0)
+        module.account_info.return_value = SimpleNamespace(equity=10000.0)
 
         settings_module = SimpleNamespace(target_symbols={"AAA": True})
 
@@ -205,7 +239,7 @@ class TestMt5SymbolsReport(unittest.TestCase):
                 encoding="utf-8",
             )
 
-            rows = collect_target_symbol_snapshots(
+            rows, equity = collect_target_symbol_snapshots(
                 env_path, settings_module=settings_module, module=module
             )
 
@@ -214,6 +248,7 @@ class TestMt5SymbolsReport(unittest.TestCase):
         self.assertEqual(rows[1].contract_size, 1.0)
         self.assertAlmostEqual(rows[0].lot_for_base or 0.0, 0.01)
         self.assertAlmostEqual(rows[1].lot_for_base or 0.0, 0.01)
+        self.assertEqual(equity, 10000.0)
         module.shutdown.assert_called_once_with()
 
 

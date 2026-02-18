@@ -4,7 +4,7 @@ import argparse
 import os
 from dataclasses import dataclass
 import math
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from config import settings
 from infrastructure.mt5.connect import Mt5ConnectionError, load_mt5_config
@@ -23,6 +23,8 @@ class SymbolSnapshot:
     exists: bool
     # MT5 bid corresponds to the "sell" price.
     sell: Optional[float] = None
+    atr: Optional[float] = None
+    atr_pct: Optional[float] = None
     contract_size: Optional[float] = None
     currency_profit: Optional[str] = None
     usd_pair_symbol: Optional[str] = None
@@ -38,6 +40,7 @@ class SymbolSnapshot:
     usd_diff_to_base: Optional[float] = None
     error: Optional[str] = None
     usd_pair_error: Optional[str] = None
+    atr_error: Optional[str] = None
 
 
 BASE_SYMBOL = "XAUUSD"
@@ -58,6 +61,148 @@ def _safe_last_error(module: Any) -> Optional[Any]:
         return module.last_error()
     except Exception:
         return None
+
+
+def _timeframe_from_settings_value(value: Any, *, module: Any) -> Optional[int]:
+    """Map settings.TIME_FRAME (e.g. 4 for 4H) to MT5 timeframe constant."""
+
+    if value is None:
+        return None
+
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return None
+
+    h1 = getattr(module, "TIMEFRAME_H1", None)
+    h4 = getattr(module, "TIMEFRAME_H4", None)
+
+    # If caller already passed MT5 constant, accept it as-is.
+    if v in {h1, h4}:
+        return v
+
+    mapping = {
+        1: h1,
+        4: h4,
+    }
+    return mapping.get(v)
+
+
+def _timeframe_label(value: Any) -> str:
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return str(value)
+
+    if v == 1:
+        return "1H"
+    if v == 4:
+        return "4H"
+    return str(value)
+
+
+def _rate_value(rec: Any, key: str) -> float:
+    # Support numpy records (rec['high']), dicts, and SimpleNamespace/objects.
+    try:
+        return float(rec[key])
+    except Exception:
+        return float(getattr(rec, key))
+
+
+def _normalize_rates_order(rates: Sequence[Any]) -> list[Any]:
+    # MT5 may return rates in either chronological order depending on wrapper/version.
+    # If time is available, sort to ensure old -> new.
+    try:
+        times = []
+        for r in rates:
+            try:
+                t = r["time"]
+            except Exception:
+                t = getattr(r, "time")
+            times.append(float(t))
+    except Exception:
+        return list(rates)
+
+    if len(times) < 2:
+        return list(rates)
+
+    # If already old->new, keep as-is.
+    if times[0] <= times[-1]:
+        return list(rates)
+
+    return [r for _, r in sorted(zip(times, rates), key=lambda x: x[0])]
+
+
+def _calculate_atr_and_close_from_rates(
+    rates: Sequence[Any], *, period: int
+) -> tuple[Optional[float], Optional[float], Optional[str]]:
+    if period <= 0:
+        return None, None, "ATR period must be positive"
+
+    try:
+        n = len(rates)
+    except Exception:
+        return None, None, "rates is not a sized sequence"
+
+    need = period + 1
+    if n < need:
+        return None, None, f"not enough rates. need={need} got={n}"
+
+    rs = _normalize_rates_order(rates)
+
+    trs: list[float] = []
+    for i in range(1, len(rs)):
+        high = _rate_value(rs[i], "high")
+        low = _rate_value(rs[i], "low")
+        prev_close = _rate_value(rs[i - 1], "close")
+        tr = max(high - low, abs(high - prev_close), abs(low - prev_close))
+        trs.append(tr)
+
+    if len(trs) < period:
+        return None, None, f"not enough TR values. need={period} got={len(trs)}"
+
+    # Wilder's smoothing (RMA). First value is SMA(TR, period), then recursive update.
+    atr = sum(trs[:period]) / float(period)
+    for tr in trs[period:]:
+        atr = ((atr * float(period - 1)) + tr) / float(period)
+
+    if not math.isfinite(atr):
+        return None, None, "ATR is not finite"
+
+    last_close = _rate_value(rs[-1], "close")
+    if not math.isfinite(last_close) or last_close <= 0:
+        return None, None, "close is not finite or non-positive"
+
+    return atr, last_close, None
+
+
+def _fetch_atr_values(
+    symbol: str,
+    *,
+    atr_period: int,
+    time_frame: Any,
+    module: Any,
+) -> tuple[Optional[float], Optional[float], Optional[str]]:
+    timeframe_const = _timeframe_from_settings_value(time_frame, module=module)
+    if timeframe_const is None:
+        return None, None, f"unsupported TIME_FRAME={time_frame!r}"
+
+    # Request additional bars for more stable Wilder smoothing when history is available.
+    count = max(int(atr_period) + 1, int(atr_period) + 50)
+    try:
+        # start_pos=1 to avoid the currently forming (incomplete) bar.
+        rates = module.copy_rates_from_pos(symbol, timeframe_const, 1, count)
+    except Exception as e:
+        return None, None, f"copy_rates_from_pos failed: {e}"
+
+    if rates is None:
+        return (
+            None,
+            None,
+            f"copy_rates_from_pos returned None. last_error={_safe_last_error(module)}",
+        )
+
+    return _calculate_atr_and_close_from_rates(rates, period=int(atr_period))
 
 
 def _select_symbol_if_needed(symbol: str, info: Any, *, module: Any) -> tuple[Any, Optional[str]]:
@@ -237,6 +382,8 @@ def adjust_lots_to_base(
                 symbol=r.symbol,
                 exists=r.exists,
                 sell=r.sell,
+                atr=r.atr,
+                atr_pct=r.atr_pct,
                 contract_size=r.contract_size,
                 currency_profit=r.currency_profit,
                 usd_pair_symbol=r.usd_pair_symbol,
@@ -250,6 +397,7 @@ def adjust_lots_to_base(
                 usd_diff_to_base=usd_diff_to_base,
                 error=r.error,
                 usd_pair_error=r.usd_pair_error,
+                atr_error=r.atr_error,
             )
         )
 
@@ -321,7 +469,13 @@ def _calc_usd_per_lot(
     return None
 
 
-def fetch_symbol_snapshot(symbol: str, *, module: Any = mt5) -> SymbolSnapshot:
+def fetch_symbol_snapshot(
+    symbol: str,
+    *,
+    module: Any = mt5,
+    atr_period: Optional[int] = None,
+    time_frame: Optional[Any] = None,
+) -> SymbolSnapshot:
     info = module.symbol_info(symbol)
     if info is None:
         return SymbolSnapshot(
@@ -352,10 +506,26 @@ def fetch_symbol_snapshot(symbol: str, *, module: Any = mt5) -> SymbolSnapshot:
         usd_pair_sell=usd_pair_sell,
     )
 
+    atr = None
+    atr_pct = None
+    atr_error = None
+    if atr_period is not None and time_frame is not None:
+        atr_raw, last_close, atr_error = _fetch_atr_values(
+            symbol,
+            atr_period=int(atr_period),
+            time_frame=time_frame,
+            module=module,
+        )
+        if atr_error is None and atr_raw is not None and last_close is not None:
+            atr = float(atr_raw)
+            atr_pct = (float(atr_raw) / float(last_close)) * 100.0
+
     return SymbolSnapshot(
         symbol=symbol,
         exists=True,
         sell=sell,
+        atr=atr,
+        atr_pct=atr_pct,
         contract_size=contract_size,
         currency_profit=currency_profit,
         usd_pair_symbol=usd_pair_symbol,
@@ -366,6 +536,7 @@ def fetch_symbol_snapshot(symbol: str, *, module: Any = mt5) -> SymbolSnapshot:
         volume_max=getattr(info, "volume_max", None),
         error=error,
         usd_pair_error=usd_pair_error,
+        atr_error=atr_error,
     )
 
 
@@ -374,10 +545,10 @@ def collect_target_symbol_snapshots(
     *,
     settings_module: Any = settings,
     module: Any = mt5,
-) -> list[SymbolSnapshot]:
+) -> tuple[list[SymbolSnapshot], Optional[float]]:
     symbols = get_enabled_target_symbols(settings_module=settings_module)
     if not symbols:
-        return []
+        return [], None
 
     if BASE_SYMBOL not in symbols:
         symbols = [BASE_SYMBOL, *symbols]
@@ -397,8 +568,22 @@ def collect_target_symbol_snapshots(
                 f"MT5 initialize failed. last_error={_safe_last_error(module)}"
             )
 
-        rows = [fetch_symbol_snapshot(symbol, module=module) for symbol in symbols]
-        return adjust_lots_to_base(rows)
+        account_info = module.account_info()
+        equity = getattr(account_info, "equity", None)
+
+        atr_period = getattr(settings_module, "ATR_PERIOD", None)
+        time_frame = getattr(settings_module, "TIME_FRAME", None)
+
+        rows = [
+            fetch_symbol_snapshot(
+                symbol,
+                module=module,
+                atr_period=int(atr_period) if atr_period is not None else None,
+                time_frame=time_frame,
+            )
+            for symbol in symbols
+        ]
+        return adjust_lots_to_base(rows), equity
     finally:
         if initialized:
             module.shutdown()
@@ -408,6 +593,7 @@ def _format_table(rows: list[SymbolSnapshot]) -> str:
     headers = [
         "symbol",
         "sell",
+        "atr_pct",
         "contract_size",
         "currency_profit",
         "usd_pair",
@@ -432,6 +618,7 @@ def _format_table(rows: list[SymbolSnapshot]) -> str:
         [
             r.symbol,
             s(r.sell),
+            s(r.atr_pct),
             s(r.contract_size),
             s(r.currency_profit),
             s(r.usd_pair_symbol),
@@ -472,12 +659,35 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    rows = collect_target_symbol_snapshots(args.env)
+    rows, equity = collect_target_symbol_snapshots(args.env)
     if not rows:
         print("No enabled target symbols.")
         return 0
 
     print("MT5 target symbols info:")
+    if equity is not None:
+        tpv_label = "TPV_LEVERAGE"
+        tpv_multiplier = getattr(settings, "TPV_LEVERAGE", None)
+        if tpv_multiplier is None:
+            # Backward compatibility for older settings.
+            tpv_label = "TPV"
+            tpv_multiplier = getattr(settings, "TPV", 1.0)
+
+        target_portfolio_value = equity * float(tpv_multiplier)
+        print(f"Account Equity: {equity:,.2f}")
+        print(
+            f"Target Portfolio Value (Equity * {tpv_label}({tpv_multiplier})): {target_portfolio_value:,.2f}"
+        )
+        print()
+
+    atr_period = getattr(settings, "ATR_PERIOD", None)
+    time_frame = getattr(settings, "TIME_FRAME", None)
+    if atr_period is not None and time_frame is not None:
+        print(
+            f"ATR% (Normalized ATR = 100 * ATR / Close, period={atr_period}, timeframe={_timeframe_label(time_frame)}):"
+        )
+        print()
+
     print(_format_table(rows))
     return 0
 

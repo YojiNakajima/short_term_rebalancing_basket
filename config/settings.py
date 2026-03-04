@@ -29,7 +29,7 @@ LEVERAGE = 1.0
 
 # TPV（equity * TPV_LEVERAGE）に対して、1ATR（ATR%）変動で許容するリスク割合
 # 例: 0.01 = TPVの1%をリスクにする
-RISK_PCT = 0.01
+RISK_PCT = 0.1
 
 ATR_PERIOD = 14
 TIME_FRAME = 4 # 4=4H, 1=1H
@@ -78,5 +78,5 @@ target_symbols = {
     'UK100': True,
     'JP225': True,
    # 'HK50': True,
-    # 'AUS200': True
+     'AUS200': True
 }
